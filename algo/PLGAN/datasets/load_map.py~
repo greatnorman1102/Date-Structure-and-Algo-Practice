@@ -1,0 +1,553 @@
+# !/usr/bin/env python
+# !encoding:utf-8
+
+import numpy as np
+import os
+import collections
+import csv
+from pprint import pprint
+from datetime import datetime
+import math
+import copy
+#import cv2
+import scipy.misc
+from mayavi import mlab
+import matplotlib.pyplot as plt
+
+menu = ['ulxmap', 'ulymap', 'x_resolution', 'y_resolution', \
+        'n_rows', 'n_cols', 'nodata', 'layertype']
+digit_map = collections.namedtuple('digit_map', ['mat'] + menu)
+
+
+class MapReader(object):
+    """Define class mapreader"""
+
+    def __init__(self, map_path, w_pix, h_pix, x_step_m, y_step_m,
+                 patch_lim_per_iter):
+        self.map_path = map_path
+        self.building, self.clutter, self.dem = self.LoadSingleMap()
+        self.width_pix = w_pix
+        self.height_pix = h_pix
+        self.x_step_m = x_step_m
+        self.y_step_m = y_step_m
+        self.patch_lim_per_iter = patch_lim_per_iter
+        self.x_step_pix = np.round(x_step_m / self.building.x_resolution)
+        self.y_step_pix = np.round(y_step_m / self.building.y_resolution)
+
+        # total number of patches that needs to be created
+        self.total_patch_no_row = np.floor(
+            (self.building.n_rows - 1) / self.y_step_pix + 1)
+        self.total_patch_no_col = np.floor(
+            (self.building.n_cols - 1) / self.x_step_pix + 1)
+        self.total_patch_no = self.total_patch_no_row * self.total_patch_no_col
+
+    def SplitBySpace(self, str):
+        """Split string by white spaces,
+        return: list of words"""
+
+        return str.split()
+
+    def LoadBilHeaderFile(self, path):
+        """Load header file (two columns) and return: parameters dict"""
+        parameters = {}
+        with open(path, 'r') as file:
+            for line in file:
+                line_split = self.SplitBySpace(line)
+                parameters[line_split[0]] = line_split[1]
+
+        if not parameters.has_key('NODATA'):
+            parameters['NODATA'] = None
+
+        return parameters
+
+    def buildDigitMap(self, mat, param, lt):
+        new_digit_map = digit_map(
+            mat=mat,
+            ulxmap=float(param['ULXMAP']),
+            ulymap=float(param['ULYMAP']),
+            x_resolution=float(param['XDIM']),
+            y_resolution=float(param['YDIM']),
+            n_rows=int(param['NROWS']),
+            n_cols=int(param['NCOLS']),
+            nodata=255 if param['NODATA'] == None else float(param['NODATA']),
+            layertype=lt)
+
+        #pprint(dict(new_digit_map._asdict()))
+        return new_digit_map
+
+    def LoadSingleMap(self):
+        """Load 3 layers of a map of a single city and
+        return 3 tables with both data matrices and
+        associated parameters."""
+        building_file = None
+        clutter_file = None
+        dem_file = None
+
+        # Building map
+        # if os.path.exists(os.path.join(self.map_path, '/Buildings/Buildings.bil.npy')):
+        if os.path.exists(
+                os.path.join(self.map_path, 'Buildings/Buildings.bil')):
+            building_file = os.path.join(self.map_path, 'Buildings/Buildings')
+        elif os.path.exists(
+                os.path.join(self.map_path, 'Buildings/BUILDINGS.bil')):
+            building_file = os.path.join(self.map_path, 'Buildings/BUILDINGS')
+        else:
+            print('Cannot find Buildings map!')
+
+        # print(building_file)
+
+        param = self.LoadBilHeaderFile(building_file + '.hdr')
+        with open(building_file + '.bil', 'rb') as fd:
+            mat = np.fromfile(
+                fd, dtype='>i2').reshape(
+                    int(param['NROWS']), int(param['NCOLS']))
+        building = self.buildDigitMap(mat, param, 'building')
+        building.mat[building.mat == building.nodata] = 0
+
+        # Clutter map
+        if os.path.exists(os.path.join(self.map_path, 'Clutter/Clutter.bil')):
+            clutter_file = os.path.join(self.map_path, 'Clutter/Clutter')
+        elif os.path.exists(os.path.join(self.map_path, 'Clutter/CLUTTER.bil')):
+            clutter_file = os.path.join(self.map_path, 'Clutter/CLUTTER')
+        else:
+            print('Cannot find Clutter map!')
+
+        param = self.LoadBilHeaderFile(clutter_file + '.hdr')
+        with open(clutter_file + '.bil', 'rb') as fd:
+            mat = np.fromfile(
+                fd, dtype='>i2').reshape(
+                    int(param['NROWS']), int(param['NCOLS']))
+        clutter = self.buildDigitMap(mat, param, 'clutter')
+
+        # dem
+        if os.path.exists(os.path.join(self.map_path, 'Heights/DEM.bil')):
+            dem_file = os.path.join(self.map_path, 'Heights/DEM')
+        else:
+            print('Cannot find Heights map!')
+
+        param = self.LoadBilHeaderFile(dem_file + '.hdr')
+        with open(dem_file + '.bil', 'rb') as fd:
+            mat = np.fromfile(
+                fd, dtype='>i2').reshape(
+                    int(param['NROWS']), int(param['NCOLS']))
+        dem = self.buildDigitMap(mat, param, 'dem')
+
+        return building, clutter, dem
+
+    def GetLayerPatch(self, layer_table, center_x_m, center_y_m):
+        """Crop a square patch from a map layer
+        The patch is a "deep copy" of the section in the layer
+        Return None if the patch is outside the map layer
+        Return None if the map layer is "clutter" and the patch contains 'nodata'"""
+
+        # x axis
+        upper_left_x_m = center_x_m - np.floor(
+            self.width_pix / 2) * layer_table.x_resolution
+        upper_left_x_pix = np.round(
+            (upper_left_x_m - layer_table.ulxmap) / layer_table.x_resolution)
+        # Return None, if x index is out of bound
+        if upper_left_x_pix < 0 or upper_left_x_pix + self.width_pix > layer_table.n_cols:
+            return None
+
+        # y axis
+        upper_left_y_m = center_y_m + np.floor(
+            self.height_pix / 2) * layer_table.y_resolution
+        upper_left_y_pix = np.round(
+            (layer_table.ulymap - upper_left_y_m) / layer_table.y_resolution)
+        # Return None, if y index is out of bound
+        if upper_left_y_pix < 0 or upper_left_y_pix + self.height_pix > layer_table.n_rows:
+            return None
+
+        # Crop patch
+        patch = layer_table.mat[int(upper_left_y_pix):int(
+            upper_left_y_pix + self.height_pix), int(upper_left_x_pix):int(
+                upper_left_x_pix + self.width_pix)]
+        # if clutter contains 'nodata', return None
+        if layer_table.layertype == 'clutter' and (layer_table.nodata in patch):
+            return None
+
+        return patch.astype(np.float)
+
+    def BSLocation(self, map_layer, ul_x_pix, ul_y_pix, min_height):
+        """Find base station location within a bounding box.
+        Select the highest point in the bounding box as BS location
+        If the highest point is lower than a limit, return None"""
+
+        if ul_x_pix > map_layer.n_cols or ul_y_pix > map_layer.n_rows:
+            return None, None, None, None, None
+
+        lr_x_pix = np.min((ul_x_pix + self.x_step_pix, map_layer.n_cols))
+        lr_y_pix = np.min((ul_y_pix + self.y_step_pix, map_layer.n_rows))
+
+        patch = map_layer.mat[int(ul_y_pix):int(lr_y_pix), int(ul_x_pix):int(
+            lr_x_pix)]
+
+        r1, i1 = np.max(patch, axis=0), np.argmax(patch, axis=0)
+        assert len(r1) > 0
+        r2, i2 = np.max(r1), np.argmax(r1)
+
+        if r2 < min_height:
+            return None, None, None, None, None
+
+        # get the index of the highest point in patch
+        x_idx = i2 + ul_x_pix
+        y_idx = i1[i2] + ul_y_pix
+
+        # translate to coordinates in UTM
+        # Note the easting and northing coordinate system
+        # meaning the value of y is decreasing with increasing index
+        x = map_layer.ulxmap + x_idx * map_layer.x_resolution
+        y = map_layer.ulymap - y_idx * map_layer.y_resolution
+
+        return x, y, x_idx, y_idx, r2
+
+    # Add by Xing Li to process building and dimension information to 3D tensor, cell value represents relative permittivity, building = concrete(4.5), dimension = silicon dioxide(3.9), rest is air(1)
+    def GenTensorInLoop(self, row_idx, col_idx, count, drawTensor=False, saveTensor=False):
+        """Generate building and dimension tensor data by cropping many map patches from a map.
+        Tensor data are saved in a 3-D tensor.
+        map_path: path to load map
+
+        width_pix: width of map patch, in pixels
+        height_pix: height of map patch, in pixels
+        x_step_m: x step of patch search, in meters
+        y_step_m: y step of patch search, in meters"""
+
+        min_height = 6
+        idx = 0
+        urbanTensor = []
+	receiveTensor = []
+
+        # site locations
+        site_locations = [['name', 'position_x', 'position_y']]
+        bs_parameters = [[
+            'name', 'antenna', 'site', 'model', 'height_reference', 'delta_x',
+            'delta_y', 'height', 'emitting_power', 'azimuth', 'tilt',
+            'set_pred_frequency', 'prediction_frequency'
+        ]]
+
+        total_patch_col = np.floor((self.building.n_cols - 1) / self.x_step_pix
+                                   + 1)
+        total_patch_row = np.floor((self.building.n_rows - 1) / self.y_step_pix
+                                   + 1)
+        total_patch = total_patch_col * total_patch_row
+
+        start_patch = total_patch_row * col_idx + row_idx
+        end_patch = np.min((start_patch + self.patch_lim_per_iter, total_patch))
+
+        ii = col_idx
+        jj = row_idx
+        i = ii * self.x_step_pix
+        j = jj * self.y_step_pix
+
+        grid = 5
+	csv_f1 = open(os.path.join(self.map_path, 'site-permittivity-tensor.csv'), 'a')
+	writerPermit = csv.writer(csv_f1)
+	csv_f2 = open(os.path.join(self.map_path, 'receiver-location-tensor.csv'), 'a')
+	writerReceive = csv.writer(csv_f2)
+	
+
+        for patch_idx in range(int(start_patch), int(end_patch)):
+            bs_x_m, bs_y_m, x_idx, y_idx, bs_height = self.BSLocation(
+                self.building, i, j, min_height)
+            # Initialize building and dimension tensor 
+            BDtensor = np.ones((224, 224, 50))
+            # Initialize receiver location tensor
+            Rectensor = np.zeros((224, 224, 50))
+            if bs_x_m and bs_y_m:
+                c_patch = self.GetLayerPatch(self.clutter, bs_x_m, bs_y_m)
+                if c_patch is not None:
+                    b_patch = self.GetLayerPatch(self.building, bs_x_m, bs_y_m)
+                    d_patch = self.GetLayerPatch(self.dem, bs_x_m, bs_y_m)
+                    if (b_patch is not None) and (d_patch is not None):
+			# Write building, dem information to 3D tensor
+			# Write dimension info first
+                        for hz in range (224):
+				for vt in range (224):
+					h_dem = int(math.ceil((d_patch[hz,vt]-np.amin(d_patch))/grid))
+					h_bil = int(math.ceil(b_patch[hz,vt]/grid))
+					for c_dem in range (min(h_dem,50)):
+						BDtensor[hz, vt, c_dem] = 3.9
+					if h_dem < 50:
+						for c_bil in range (h_dem, h_dem+h_bil):
+							BDtensor[hz, vt, c_bil] = 4.5
+					# Set receiver position (2 meters above DEM layer)
+					Rectensor[hz, vt, min(h_dem,50)] = 1
+					#print('At (%d, %d) location, building height is: %d, dem height is: %d.' % (hz, vt, h_bil, h_dem))
+			urbanTensor.append(np.array(BDtensor).reshape(1, 224*224*50))
+			receiveTensor.append(np.array(Rectensor).reshape(1, 224*224*50))
+
+			if drawTensor:
+				# Plot 3D dense map
+				#mlab.contour3d(BDtensor, contours=4, transparent=True)     
+				mlab.contour3d(Rectensor)
+				mlab.contour3d(BDtensor)          			
+				# Double check the slice layer
+				plt.imshow(BDtensor[:,:,5])
+				plt.colorbar()
+				plt.show()        
+			if saveTensor:
+                        	writerPermit.writerows(np.array(BDtensor).reshape(1, 224*224*50))
+				writerReceive.writerows(np.array(Rectensor).reshape(1, 224*224*50))
+
+                        idx = idx + 1
+
+            if jj == total_patch_row:
+                ii = ii + 1
+                jj = 0
+            else:
+                jj = jj + 1
+
+            i = ii * self.x_step_pix
+            j = jj * self.y_step_pix
+
+	csv_f1.close()
+	csv_f2.close()
+        if idx > 0:
+            return urbanTensor,receiveTensor, idx, site_locations, bs_parameters, jj, ii
+        else:
+            return None, None, idx, site_locations, bs_parameters, jj, ii
+
+    def GenPatchInLoop(self, row_idx, col_idx, count):
+        """Generate patch data by cropping many map patches from a map.
+        Patch data are saved in a 4-D tensor, base station
+        location and related parameters will be saved in a table and csv file.
+        map_path: path to load map
+        width_pix: width of map patch, in pixels
+        height_pix: height of map patch, in pixels
+        x_step_m: x step of patch search, in meters
+        y_step_m: y step of patch search, in meters"""
+
+        # is_first_call = (row_idx == 1) and (col_idx == 1)
+        is_first_call = (row_idx == 0) and (col_idx == 0)
+        sava_sample_flg = True
+        min_height = 6
+        idx = 0
+        data_tensor = np.empty((self.patch_lim_per_iter, 3, self.width_pix,
+                                self.height_pix))
+
+        # site locations
+        site_locations = [['name', 'position_x', 'position_y']]
+        bs_parameters = [[
+            'name', 'antenna', 'site', 'model', 'height_reference', 'delta_x',
+            'delta_y', 'height', 'emitting_power', 'azimuth', 'tilt',
+            'set_pred_frequency', 'prediction_frequency'
+        ]]
+
+        total_patch_col = np.floor((self.building.n_cols - 1) / self.x_step_pix
+                                   + 1)
+        total_patch_row = np.floor((self.building.n_rows - 1) / self.y_step_pix
+                                   + 1)
+        total_patch = total_patch_col * total_patch_row
+
+        start_patch = total_patch_row * col_idx + row_idx
+        end_patch = np.min((start_patch + self.patch_lim_per_iter, total_patch))
+
+        ii = col_idx
+        jj = row_idx
+        i = ii * self.x_step_pix
+        j = jj * self.y_step_pix
+
+	# OmniDirection 2D Pattern
+	gain = 18
+	grid = 5
+	c = 3*10**8 # speed of light 3x10^8 m/s
+	feq = 2.1*10**6 # 2100 kHz, 2.1x10^6 Hz
+	lamda = c/feq
+	antPat = np.zeros((224, 224))
+	for x in range(224):
+		for y in range(224):
+			x_corrd, y_corrd = x-112, y-112
+			# Calculate distance loss for Omnidirection Antenna
+			distance = grid * math.sqrt(x_corrd**2+y_corrd**2)
+			FSPL = math.sqrt(math.pi*4*distance/lamda)
+			antPat[x,y] = round((gain - FSPL), 2)
+	# Mark the signal source, center of the patch
+	sigSrc = np.zeros((224,224))
+	sigSrc[112, 112] = 1.0
+	# Initialize input 3 channel, [0] b_patch, [1] d_patch, [2] AntPat
+	info_patch = np.zeros((224, 224, 3))
+
+        for patch_idx in range(int(start_patch), int(end_patch)):
+            bs_x_m, bs_y_m, x_idx, y_idx, bs_height = self.BSLocation(
+                self.building, i, j, min_height)
+            if bs_x_m and bs_y_m:
+                c_patch = self.GetLayerPatch(self.clutter, bs_x_m, bs_y_m)
+                if c_patch is not None:
+                    b_patch = self.GetLayerPatch(self.building, bs_x_m, bs_y_m)
+                    d_patch = self.GetLayerPatch(self.dem, bs_x_m, bs_y_m)
+                    if (b_patch is not None) and (d_patch is not None):
+                        bp = np.array(b_patch).reshape(1, 1, self.width_pix,
+                                                       self.height_pix)
+                        cp = np.array(c_patch).reshape(1, 1, self.width_pix,
+                                                       self.height_pix)
+                        dp = np.array(d_patch).reshape(1, 1, self.width_pix,
+                                                       self.height_pix)
+                        patch = np.column_stack((bp, cp, dp))
+
+			# Write building, dem and combined patches to images
+			# Add by Xing Li
+			info_path = os.path.join(self.map_path, 'info_patch_20m')
+			if not os.path.exists(info_path):
+			    	os.makedirs(info_path)
+			info_patch[:,:,0] = c_patch
+			info_patch[:,:,1] = antPat
+			info_patch[:,:,2] = sigSrc
+			scipy.misc.imsave((info_path + '/info_patch_%d.jpg' % (idx+count+1)), info_patch)
+
+#			b_path = os.path.join(self.map_path, 'b_patch_20m')
+#			if not os.path.exists(b_path):
+#			    	os.makedirs(b_path)
+#			scipy.misc.imsave((b_path + '/b_patch_%d.jpg' % (idx+count+1)), b_patch)
+		
+#			d_path = os.path.join(self.map_path, 'd_patch_20m')
+#			if not os.path.exists(d_path):
+#	    			os.makedirs(d_path)
+#			scipy.misc.imsave((d_path + '/d_patch_%d.jpg' % (idx+count+1)),  d_patch-np.amin(d_patch))
+
+#			c_path = os.path.join(self.map_path, 'c_patch_20m')
+#			if not os.path.exists(c_path):
+#	    			os.makedirs(c_path)
+#			scipy.misc.imsave((c_path + '/c_patch_%d.jpg' % (idx+count+1)),  antPat)
+			
+			
+
+			data_tensor[idx] = c_patch
+			site_locations.append([idx + count + 1, bs_x_m, bs_y_m])
+			bs_parameters.append([
+				    str(idx + count + 1) + '_A', 'isotropic',
+				    idx + count + 1, 'model1', 'ground', 0, 0,
+				    bs_height, 18.22, 0, 0, 'false', 2100
+				])
+			idx = idx + 1
+
+
+            if jj == total_patch_row:
+                ii = ii + 1
+                jj = 0
+            else:
+                jj = jj + 1
+
+            i = ii * self.x_step_pix
+            j = jj * self.y_step_pix
+
+	#cv2.destroyAllWindows()	
+
+        # save csv files
+        if sava_sample_flg:
+            if is_first_call:
+                csv_f = open(
+                    os.path.join(self.map_path, 'site-locations-20m.csv'), 'wb')
+                writer = csv.writer(csv_f)
+                writer.writerows(site_locations)
+                csv_f.close()
+
+                csv_f = open(
+                    os.path.join(self.map_path, 'BS-parameters-20m.csv'), 'wb')
+                writer = csv.writer(csv_f)
+                writer.writerows(bs_parameters)
+                csv_f.close()
+            elif idx > 0:
+                csv_f = open(
+                    os.path.join(self.map_path, 'site-locations-20m.csv'), 'a+b')
+                writer = csv.writer(csv_f)
+                writer.writerows(site_locations[1:])
+                csv_f.close()
+
+                csv_f = open(
+                    os.path.join(self.map_path, 'BS-parameters-20m.csv'), 'a+b')
+                writer = csv.writer(csv_f)
+                writer.writerows(bs_parameters[1:])
+                csv_f.close()
+
+        if idx > 0:
+            return data_tensor[0:
+                               idx], idx, site_locations, bs_parameters, jj, ii
+        else:
+            return None, idx, site_locations, bs_parameters, jj, ii
+
+    def LoadPatchData(self, map_path, bs_start, bs_end, width_pix, height_pix, x_step_m,
+                      y_step_m):
+        timer = datetime.now()
+        # load single map
+        building, clutter, dem = self.LoadSingleMap()
+        # image.save(map_path .. '/sample-patches/building.jpg', building.mat)
+        # print(building)
+        # print(clutter)
+        # print(dem)
+        print('map loaded at: ' + str(datetime.now()))
+        min_height = 6
+        # generate pixel based size info
+        x_step = int(math.ceil(x_step_m / building.x_resolution))
+        y_step = int(math.ceil(y_step_m / building.y_resolution))
+        # print('xstep = '.. x_step .. ' ystep = '..y_step)
+        idx = 0
+
+        # get the number of patches
+        with open(os.path.join(map_path, 'site-locations.csv'),
+                  'rb') as csvfile:
+            memory_batch = len(csvfile.readlines())
+
+
+        if memory_batch < bs_end:
+            bs_end = memory_batch
+
+        # collectgarbage(); collectgarbage()
+        print("BS Size:"),
+        print(bs_end - bs_start)
+
+        data_tensor = None
+        data_tensor = np.ndarray(
+            shape=((bs_end - bs_start), 2, width_pix, height_pix), dtype=float)
+
+        # Tables for site locations
+        site_locations = [['name', 'position_x', 'position_y']]
+        bs_parameters = [[
+            'name', 'antenna', 'site', 'model', 'height_reference', 'delta_x',
+            'delta_y', 'height', 'emitting_power', 'azimuth', 'tilt',
+            'set_pred_frequency', 'prediction_frequency'
+        ]]
+
+        print('start map search at: ' + str(datetime.now()))
+        for i in range(0, building.n_cols, x_step):
+            for j in range(0, building.n_rows, y_step):
+                # print('i = ' .. i .. ' j = ' .. j)
+                bs_x_m, bs_y_m, x_idx, y_idx, bs_height = self.BSLocation(
+                    self.building, i, j, min_height)
+                if bs_x_m > 0 and bs_y_m > 0:
+                    # print('x = ' .. bs_x_m .. ' y = ' .. bs_y_m)
+                    # print('x idx = ' .. x_idx .. ' y idx = ' .. y_idx)
+                    c_patch = self.GetLayerPatch(clutter, bs_x_m, bs_y_m)
+                    if c_patch is not None:  # then --TODO: remove this since clutter map is not used, but need to rerun volcano simulation...
+                        #print(c_patch)
+                        b_patch = self.GetLayerPatch(building, bs_x_m, bs_y_m)
+                        d_patch = self.GetLayerPatch(dem, bs_x_m, bs_y_m)
+                        if (b_patch is not None) and (d_patch is not None):
+                            # print(b_patch)
+                            # local bp = b_patch:reshape(1, 1, width_pix, height_pix)
+                            # local cp = c_patch:reshape(1, 1, width_pix, height_pix)
+                            # local dp = d_patch:reshape(1, 1, width_pix, height_pix)
+                            # local patch = bp:cat(cp,2):cat(dp,2)
+                            # print('patch')
+                            # print(patch)
+
+                            # print('Patch index = ' .. idx)
+                            # print(b_patch.reshape(width_pix, height_pix))
+                            data_tensor[idx][0] = copy.copy(
+                                b_patch.reshape(width_pix, height_pix))
+                            data_tensor[idx][1] = copy.copy(
+                                d_patch.reshape(width_pix, height_pix))
+                            #
+                            site_locations.append([idx, bs_x_m, bs_y_m])
+                            bs_parameters.append([
+                                str(idx) + '_A', 'isotropic', idx, 'model1',
+                                'ground', 0, 0, bs_height, 18.22, 0, 0, 'false',
+                                2100
+                            ])
+
+                            idx = idx + 1
+                            if idx >= (bs_end - bs_start):
+                                return data_tensor, idx - 1, site_locations, bs_parameters
+
+        print('finished map search at: ' + str(datetime.now()))
+
+        return data_tensor[0:idx], idx, site_locations, bs_parameters
